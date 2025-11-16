@@ -1,0 +1,7 @@
+{
+  "Moscow": { "lat": 55.7558, "lon": 37.6173 },
+  "Kazan": { "lat": 55.7964, "lon": 49.1089 },
+  "Saint Petersburg": { "lat": 59.9386, "lon": 30.3141 },
+  "Novosibirsk": { "lat": 55.0188, "lon": 82.9339 },
+  "Ekaterinburg": { "lat": 56.8519, "lon": 60.6122 }
+}
