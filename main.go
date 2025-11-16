@@ -1,6 +1,4 @@
-// TODO: завтра надо:
-// TODO: 4) на месте заглушки реализовать реальный выбор города
-// TODO: и добавить считывание прогнозов погоды по всем городам
+// TODO: разбить код на пакеты,убрать глобальные переменные и обложить тестами
 package main
 
 import (
@@ -11,10 +9,26 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 )
+
+var cities map[string]struct {
+	Lat float64
+	Lon float64
+}
+
+type ForecastMessage struct {
+	City     string
+	Forecast Forecast
+}
+
+type NotifyMessage struct {
+	City string
+	Text string
+}
 
 type Forecast struct {
 	Daily struct {
@@ -27,22 +41,31 @@ type Forecast struct {
 }
 
 // запрашиваю и возвращаю прогноз погоды
-func getForecast() Forecast {
+func getForecast(city string) Forecast {
 	apiKey := os.Getenv("API_KEY")
 
-	lat := 55.7558
-	lon := 37.6173
+	c, ok := cities[city]
+	if !ok {
+		fmt.Printf("город '%s' не найден, беру Москву\n", city)
+		c = cities["Moscow"]
+	}
 
 	url := fmt.Sprintf(
 		"https://www.meteosource.com/api/v1/free/point?lat=%f&lon=%f&sections=daily&timezone=auto&language=en&key=%s",
-		lat, lon, apiKey,
+		c.Lat, c.Lon, apiKey,
 	)
 
-	r, _ := http.Get(url)
+	r, err := http.Get(url)
+	if err != nil {
+		fmt.Println("Ошибка запроса прогноза:", err)
+		return Forecast{}
+	}
 	defer r.Body.Close()
 
 	var f Forecast
-	json.NewDecoder(r.Body).Decode(&f)
+	if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
+		fmt.Println("Ошибка декодирования прогноза:", err)
+	}
 	return f
 }
 
@@ -62,8 +85,6 @@ func forecastToMap(f Forecast) map[string]string {
 	}
 	return m
 }
-
-//TODO: dfdfd
 
 type Update struct {
 	UpdateID int `json:"update_id"`
@@ -137,15 +158,15 @@ func sendCitySelection(botToken string, chatID int64) {
 	keyboard := map[string]interface{}{
 		"inline_keyboard": [][]map[string]string{
 			{
-				{"text": "Москва", "callback_data": "Москва"},
+				{"text": "Москва", "callback_data": "Moscow"},
 			},
 			{
-				{"text": "Казань", "callback_data": "Казань"},
-				{"text": "Санкт-Петербург", "callback_data": "Санкт-Петербург"},
+				{"text": "Казань", "callback_data": "Kazan"},
+				{"text": "Санкт-Петербург", "callback_data": "Saint Petersburg"},
 			},
 			{
-				{"text": "Новосибирск", "callback_data": "Новосибирск"},
-				{"text": "Екатеринбург", "callback_data": "Екатеринбург"},
+				{"text": "Новосибирск", "callback_data": "Novosibirsk"},
+				{"text": "Екатеринбург", "callback_data": "Ekaterinburg"},
 			},
 		},
 	}
@@ -182,35 +203,62 @@ func main() {
 	godotenv.Load()
 	botToken := os.Getenv("BOT_TOKEN")
 
-	forecastCh := make(chan Forecast)
-	notifyCh := make(chan string)
+	forecastCh := make(chan ForecastMessage)
+	notifyCh := make(chan NotifyMessage)
+	var subMu sync.RWMutex
+	subscribers := make(map[int64]string)
+
+	file, err := os.ReadFile("cities.json")
+	if err != nil {
+		fmt.Println("Ошибка чтения", err)
+		return
+	}
+	if err := json.Unmarshal(file, &cities); err != nil {
+		fmt.Println("Ошибка парсинга", err)
+		return
+	}
 
 	// 1я горутина: получает прогноз
 	go func() {
 		for {
-			f := getForecast()
+			for city := range cities {
 
-			// удаляю из summary температуру
-			for i := range f.Daily.Data {
-				s := f.Daily.Data[i].Summary
-				if idx := strings.Index(s, "Temperature"); idx != -1 {
-					f.Daily.Data[i].Summary = strings.TrimSpace(s[:idx])
+				f := getForecast(city)
+
+				for i := range f.Daily.Data {
+					s := f.Daily.Data[i].Summary
+					if idx := strings.Index(s, "Temperature"); idx != -1 {
+						f.Daily.Data[i].Summary = strings.TrimSpace(s[:idx])
+					}
+				}
+
+				fmt.Printf("отправляю прогноз для %s во 2-ю горутину\n", city)
+				forecastCh <- ForecastMessage{
+					City:     city,
+					Forecast: f,
 				}
 			}
-			fmt.Println("отправляю сообщение 2ой горутине")
-			forecastCh <- f
-			time.Sleep(10 * time.Minute)
+
+			time.Sleep(30 * time.Minute) //можно и 20
 		}
 	}()
 
 	// 2я горутина: ищет изменения в прогнозе
 	go func() {
-		var lastSummary map[string]string
-		for f := range forecastCh {
+		lastSummary := make(map[string]map[string]string)
+
+		for msg := range forecastCh {
+			city := msg.City
+			f := msg.Forecast
+
 			currentSummary := forecastToMap(f)
 
+			if lastSummary[city] == nil {
+				lastSummary[city] = make(map[string]string)
+			}
+
 			changed := false
-			changesText := "изменения в прогнозе погоды:\n"
+			changesText := fmt.Sprintf("изменения в прогнозе погоды (%s):\n", city)
 
 			dates := make([]string, 0, len(currentSummary))
 			for date := range currentSummary {
@@ -220,29 +268,33 @@ func main() {
 
 			for _, date := range dates {
 				summary := currentSummary[date]
-				if lastSummary == nil || lastSummary[date] != summary {
+
+				if lastSummary[city][date] != summary {
 					changed = true
 					changesText += fmt.Sprintf("%s: %s\n", date, summary)
 				}
 			}
 
 			if changed {
-				fmt.Println("изменения в Summary обнаружены")
+				fmt.Println("изменения в summary обнаружены для", city)
 				fmt.Println("отправляю сообщение 3ей горутине")
 				fmt.Println(changesText)
-				lastSummary = currentSummary
-				notifyCh <- changesText
+
+				lastSummary[city] = currentSummary
+
+				// отправляем сообщение в канал третьей горутины
+				notifyCh <- NotifyMessage{
+					City: city,
+					Text: changesText,
+				}
+
 			} else {
-				fmt.Println("изменений в Summary нет")
+				fmt.Println("изменений в Summary нет для", city)
 			}
 		}
 	}()
 
-	//TODO: dfdf
-
-	subscribers := make(map[int64]bool)
-
-	// горутина для приёма телеграм-команд
+	// горутина для телеграм-команд
 	go func() {
 		offset := 0
 		for {
@@ -250,7 +302,6 @@ func main() {
 			offset = newOffset
 
 			for _, update := range updates {
-				//обычное
 				if update.Message != nil {
 					chatID := update.Message.Chat.ID
 					text := update.Message.Text
@@ -263,26 +314,32 @@ func main() {
 						sendCitySelection(botToken, chatID)
 
 					case "Отписаться ❌":
+						subMu.Lock()
 						delete(subscribers, chatID)
-						sendTelegramMessage(botToken, fmt.Sprint(chatID), "❌ Вы отписались от уведомлений о погоде")
+						subMu.Unlock()
+						sendTelegramMessage(botToken, fmt.Sprint(chatID),
+							"❌ Вы отписались от уведомлений о погоде")
 					}
 				}
 
-				//выбор города
+				// выбор города
 				if update.CallbackQuery != nil {
 					callback := update.CallbackQuery
 					chatID := callback.From.ID
 					city := callback.Data
 
-					//TODO: подписываем пользователя (пока без фильтра по городу)
-					subscribers[chatID] = true
+					subMu.Lock()
+					subscribers[chatID] = city
+					subMu.Unlock()
 
 					removeInlineKeyboard(botToken, chatID, callback.Message.MessageID)
 					answerCallbackQuery(botToken, callback.ID)
-					sendTelegramMessage(botToken, fmt.Sprint(chatID),
-						fmt.Sprintf("✅ Подписка оформлена! Город: %s", city))
+					sendTelegramMessage(
+						botToken,
+						fmt.Sprint(chatID),
+						fmt.Sprintf("✅ Подписка оформлена! Город: %s", city),
+					)
 				}
-
 			}
 
 			time.Sleep(2 * time.Second)
@@ -292,12 +349,24 @@ func main() {
 	// 3я горутина: рассылка всем подписчикам
 	go func() {
 		for msg := range notifyCh {
-			for chatID := range subscribers {
-				sendTelegramMessage(botToken, fmt.Sprint(chatID), msg)
+			subMu.RLock()
+			for chatID, userCity := range subscribers {
+				if userCity == msg.City {
+					sendTelegramMessage(
+						botToken,
+						fmt.Sprint(chatID),
+						msg.Text,
+					)
+				}
 			}
+			subMu.RUnlock()
 		}
 	}()
 
+	select {}
+}
+
+/*
 	// Горутина для теста подписки
 	go func() {
 		for {
@@ -307,6 +376,4 @@ func main() {
 			time.Sleep(5 * time.Second)
 		}
 	}()
-
-	select {}
-}
+*/
